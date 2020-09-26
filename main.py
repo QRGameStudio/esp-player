@@ -211,4 +211,17 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # noinspection PyBroadException
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        try:
+            import traceback
+            traceback.print_exc()
+        except ImportError:
+            traceback = None
+        while True:
+            blink(1)
+            sleep(1)
