@@ -1,6 +1,7 @@
 #!/bin/bash
 PORT="/dev/ttyUSB0"
 WEB="$(realpath '../qrpr.eu/')"
+SUMS="/tmp/$$_sums.txt"
 
 echo "Pushing new software"
 ampy --port "$PORT" put 'main.py'  || exit 4
@@ -21,6 +22,7 @@ while read -r f; do
         }
         createdDirs["$td"]=1
         echo "  $f -> $tf"
+        md5sum "$f" >> "$SUMS"
         ampy --port "$PORT" put "$f" "$tf" || exit 4
 done <<< "$(git ls-files)"
 

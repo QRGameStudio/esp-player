@@ -1,29 +1,30 @@
 from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
 from select import select
 try:
-    from typing import Dict, List, Set, Tuple
+    from typing import Dict, List, Set, Tuple, Optional
 except ImportError:
-    Dict, List, Set, Tuple = (dict, list, set, tuple)
+    Dict, List, Set, Tuple, Optional = (dict, list, set, tuple, any)
 
 from network import WLAN, AP_IF
 from machine import Pin
 from time import sleep
+from os import listdir
 
-CONTENT = """\
-HTTP/1.0 200 OK
+PRINT_WEB = True
+PRINT_DNS = False
 
-<!doctype html>
-<html>
-    <head>
-        <title>MicroPython Captive LED Portal</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta charset="utf8">
-    </head>
-    <body>
-        <h1>Working!</h1>
-    </body>
-</html>
-""".encode('ascii')
+# these hosts will not be redirected and others will be redirected to the first one
+ACCEPTED_HOSTS = ['qrpr.eu', 'test.qrpr.eu', 'unsecure.qrpr.eu']
+
+
+HTTP = {
+    'OK': 'HTTP/1.0 200 OK\n\n'.encode('ascii'),
+    'REDIRECT': ('HTTP/1.0 302 Found\nLocation: http://%s\n\n'
+                 '<head>'
+                 '<meta http-equiv="Refresh" content="0; URL=http://%s">'
+                 '<script>window.location.replace(`http://%s`)</script>'
+                 '</head>' % (ACCEPTED_HOSTS[0], ACCEPTED_HOSTS[0], ACCEPTED_HOSTS[0])).encode('ascii')
+}
 
 
 class DNSQuery:
@@ -70,6 +71,16 @@ def create_wifi():  # type: () -> str
     return ap.ifconfig()[0]
 
 
+def file_exists(path):  # type: (str) -> bool
+    path_parts = path.split('/')
+    filename = path_parts[-1]
+    dirpath = '/'.join(path_parts[:-1])
+    try:
+        return filename in listdir(dirpath)
+    except OSError:
+        return False
+
+
 def main():
     # safeguard if everything went bananas
     print("Initializing")
@@ -82,52 +93,75 @@ def main():
     dns_socket = socket(AF_INET, SOCK_DGRAM)
     dns_socket.setblocking(False)
     dns_socket.bind(('', 53))
-    print("DNS Server: Listening %s:53" % device_ip)
+    if PRINT_DNS:
+        print("DNS Server: Listening %s:53" % device_ip)
 
     # Web Server
     web_server_socket = socket(AF_INET, SOCK_STREAM)
     web_server_socket.setblocking(False)
     web_server_socket.bind(('', 80))
-    web_server_socket.listen(16)
-    print("Web Server: Listening http://%s:80/" % device_ip)
+    web_server_socket.listen(64)
+    if PRINT_WEB:
+        print("Web Server: Listening http://%s:80/" % device_ip)
 
     all_readers = [web_server_socket, dns_socket]  # type: List[socket]
 
-    write_cache = []  # type: List[Tuple[socket, bytes]]
+    write_cache = []  # type: List[Tuple[socket, bytes, Optional[str], int]]
     all_writers = []  # type: List[socket]
 
     while True:
         readers, writers, in_error = select(all_readers, all_writers, all_writers + all_readers)
-        print('sockets: ', len(readers), len(writers), len(in_error), len(all_readers), len(all_writers), len(write_cache))
+
+        print("ALL: Sockets count:", len(all_readers), len(all_writers), len(in_error), len(write_cache))
 
         if web_server_socket in readers:
-            print("Web: incoming client")
+            if PRINT_WEB:
+                print("Web: incoming client")
             client_soc, _ = web_server_socket.accept()
             all_readers.append(client_soc)
             readers.remove(web_server_socket)
         if dns_socket in readers:
-            print("DNS: incoming request")
-            data, client_addr = dns_socket.recvfrom(1024)
-            p = DNSQuery(data)
+            if PRINT_DNS:
+                print("DNS: incoming request")
+            filepath, client_addr = dns_socket.recvfrom(1024)
+            p = DNSQuery(filepath)
             dns_socket.sendto(p.redirect(device_ip), client_addr)
-            print('DNS: redirect %s -> %s' % (p.domain, device_ip))
+            if PRINT_DNS:
+                print('DNS: redirect %s -> %s' % (p.domain, device_ip))
             readers.remove(dns_socket)
 
         finished_readers = []
         for reader in readers:
             # HTTP requests
             request_lines = reader.recv(4096).decode('ascii').splitlines()
+            filepath = ''
+            host = ''
             for line in request_lines:
-                if line.startswith('GET'):
+                lower = line.lower()
+                if lower.startswith('get'):
                     try:
                         filepath = line.split(' ')[1]
-                        print('Web: serving', filepath)
-                        if reader not in all_writers:
-                            all_writers.append(reader)
-                            write_cache.append((reader, CONTENT))
                     except IndexError:
                         pass
-                    break
+                if lower.startswith('host'):
+                    try:
+                        host = line.split(' ')[1]
+                    except IndexError:
+                        pass
+            if host.lower() in ACCEPTED_HOSTS:
+                filepath = 'web' + filepath
+                if PRINT_WEB:
+                    print('Web: serving', filepath)
+
+                if not file_exists(filepath):
+                    filepath = 'web/index.html'
+                write_cache.append((reader, HTTP['OK'], filepath, 0))
+            else:
+                if PRINT_WEB:
+                    print('WEB: Preparing redirect of', host)
+                write_cache.append((reader, HTTP['REDIRECT'], None, 0))
+            if reader not in all_writers:
+                all_writers.append(reader)
             finished_readers.append(reader)
 
         for reader in finished_readers:
@@ -137,18 +171,28 @@ def main():
                 pass
 
         finished_writers = []
-        write_cache_finished = []  # type: List[Tuple[socket, bytes]]
-        for writer in all_writers:
-            to_write_next = []  # type: List[Tuple[socket, bytes]]
+        write_cache_finished = []  # type: List[Tuple[socket, bytes, Optional[str], int]]
+        for writer in writers:
+            to_write_next = []  # type: List[Tuple[socket, bytes, Optional[str], int]]
             for to_send in write_cache:
-                writer2, data = to_send
-                if writer != writer2:
+                requestor, http_bytes, filepath, offset = to_send
+                if writer != requestor:
                     continue
-                bytes_to_send = data[:1024]
-                bytes_left = data[1024:]
-                writer.send(bytes_to_send)
-                if bytes_left:
-                    to_write_next.append((writer, bytes_left))
+
+                # start of the message, send the HTTP first
+                if offset == 0:
+                    writer.send(http_bytes)
+                if filepath is not None:
+                    with open(filepath, 'rb') as f:
+                        f.seek(offset)
+                        bytes_to_send = f.read(4096)
+                        if len(bytes_to_send) == 4096:
+                            offset += 4096
+                        else:
+                            offset = 0
+                    writer.send(bytes_to_send)
+                if offset:
+                    to_write_next.append((writer, bytes(), filepath, offset))
                 write_cache_finished.append(to_send)
             if to_write_next:
                 write_cache.extend(to_write_next)
