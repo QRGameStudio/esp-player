@@ -1,13 +1,15 @@
-import socket
-import network
-import time
-import machine
+from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
+from select import select
+try:
+    from typing import Dict, List, Set, Tuple
+except ImportError:
+    Dict, List, Set, Tuple = (dict, list, set, tuple)
 
-ap = network.WLAN(network.AP_IF)
-ap.active(True)
-ap.config(essid="QRGames Player", authmode=1)
+from network import WLAN, AP_IF
+from machine import Pin
+from time import sleep
 
-CONTENT = b"""\
+CONTENT = """\
 HTTP/1.0 200 OK
 
 <!doctype html>
@@ -18,43 +20,30 @@ HTTP/1.0 200 OK
         <meta charset="utf8">
     </head>
     <body>
-        <h1>Change my LED Color!!!</h1>
-        <p>You are my #{:d} user!</p>
-        <form action="/led">
-            <input type="checkbox" name="r" {}>Red<br>
-            <input type="checkbox" name="g" {}>Green<br>
-            <input type="checkbox" name="b" {}>Blue<br>
-            <input type="submit" value="change">
-        </form>
-
-        <script>
-
-        </script>
+        <h1>Working!</h1>
     </body>
 </html>
-"""
+""".encode('ascii')
 
 
 class DNSQuery:
-    def __init__(self, data):
+    def __init__(self, data):  # type: (bytes) -> None
         self.data = data
-        self.dominio = ''
+        self.domain = ''
 
-        print("Reading datagram data...")
         m = data[2]  # ord(data[2])
-        tipo = (m >> 3) & 15  # Opcode bits
-        if tipo == 0:  # Standard query
+        query_type = (m >> 3) & 15  # Opcode bits
+        if query_type == 0:  # Standard query
             ini = 12
             lon = data[ini]  # ord(data[ini])
             while lon != 0:
-                self.dominio += data[ini + 1:ini + lon + 1].decode("utf-8") + '.'
+                self.domain += data[ini + 1:ini + lon + 1].decode("utf-8") + '.'
                 ini += lon + 1
                 lon = data[ini]  # ord(data[ini])
 
-    def respuesta(self, ip):
+    def redirect(self, ip):  # type: (str) -> bytes
         packet = b''
-        print("Resposta {} == {}".format(self.dominio, ip))
-        if self.dominio:
+        if self.domain:
             packet += self.data[:2] + b"\x81\x80"
             packet += self.data[4:6] + self.data[4:6] + b'\x00\x00\x00\x00'  # Questions and Answers Counts
             packet += self.data[12:]  # Original Domain Name Question
@@ -65,71 +54,117 @@ class DNSQuery:
         return packet
 
 
-def start():
-    # DNS Server
-    ip = ap.ifconfig()[0]
-    print('DNS Server: dom.query. 60 IN A {:s}'.format(ip))
+def blink(seconds):  # type: (float) -> None
+    led = Pin(2, Pin.OUT)
+    led.on()
+    sleep(seconds)
+    led.off()
 
-    udps = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udps.setblocking(False)
-    udps.bind(('', 53))
+
+def create_wifi():  # type: () -> str
+    ssid = "QRGames Player"
+
+    ap = WLAN(AP_IF)
+    ap.active(True)
+    ap.config(essid=ssid)
+    return ap.ifconfig()[0]
+
+
+def main():
+    # safeguard if everything went bananas
+    print("Initializing")
+    blink(2)
+
+    device_ip = create_wifi()
+    print("Running with IP", device_ip)
+
+    # DNS Server
+    dns_socket = socket(AF_INET, SOCK_DGRAM)
+    dns_socket.setblocking(False)
+    dns_socket.bind(('', 53))
+    print("DNS Server: Listening %s:53" % device_ip)
 
     # Web Server
-    s = socket.socket()
-    ai = socket.getaddrinfo(ip, 80)
-    print("Web Server: Bind address info:", ai)
-    addr = ai[0][-1]
+    web_server_socket = socket(AF_INET, SOCK_STREAM)
+    web_server_socket.setblocking(False)
+    web_server_socket.bind(('', 80))
+    web_server_socket.listen(16)
+    print("Web Server: Listening http://%s:80/" % device_ip)
 
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(addr)
-    s.listen(1)
-    s.settimeout(2)
-    print("Web Server: Listening http://{}:80/".format(ip))
+    all_readers = [web_server_socket, dns_socket]  # type: List[socket]
 
-    counter = 0
+    write_cache = []  # type: List[Tuple[socket, bytes]]
+    all_writers = []  # type: List[socket]
 
-    try:
-        while 1:
+    while True:
+        readers, writers, in_error = select(all_readers, all_writers, all_writers + all_readers)
+        print('sockets: ', len(readers), len(writers), len(in_error), len(all_readers), len(all_writers), len(write_cache))
 
-            # DNS Loop
-            print("Before DNS...")
+        if web_server_socket in readers:
+            print("Web: incoming client")
+            client_soc, _ = web_server_socket.accept()
+            all_readers.append(client_soc)
+            readers.remove(web_server_socket)
+        if dns_socket in readers:
+            print("DNS: incoming request")
+            data, client_addr = dns_socket.recvfrom(1024)
+            p = DNSQuery(data)
+            dns_socket.sendto(p.redirect(device_ip), client_addr)
+            print('DNS: redirect %s -> %s' % (p.domain, device_ip))
+            readers.remove(dns_socket)
+
+        finished_readers = []
+        for reader in readers:
+            # HTTP requests
+            request_lines = reader.recv(4096).decode('ascii').splitlines()
+            for line in request_lines:
+                if line.startswith('GET'):
+                    try:
+                        filepath = line.split(' ')[1]
+                        print('Web: serving', filepath)
+                        if reader not in all_writers:
+                            all_writers.append(reader)
+                            write_cache.append((reader, CONTENT))
+                    except IndexError:
+                        pass
+                    break
+            finished_readers.append(reader)
+
+        for reader in finished_readers:
             try:
-                data, addr = udps.recvfrom(1024)
-                print("incomming datagram...")
-                p = DNSQuery(data)
-                udps.sendto(p.respuesta(ip), addr)
-                print('Replying: {:s} -> {:s}'.format(p.dominio, ip))
-            except:
-                print("No dgram")
+                all_readers.remove(reader)
+            except ValueError:
+                pass
 
-            # Web loop
-            print("before accept...")
+        finished_writers = []
+        write_cache_finished = []  # type: List[Tuple[socket, bytes]]
+        for writer in all_writers:
+            to_write_next = []  # type: List[Tuple[socket, bytes]]
+            for to_send in write_cache:
+                writer2, data = to_send
+                if writer != writer2:
+                    continue
+                bytes_to_send = data[:1024]
+                bytes_left = data[1024:]
+                writer.send(bytes_to_send)
+                if bytes_left:
+                    to_write_next.append((writer, bytes_left))
+                write_cache_finished.append(to_send)
+            if to_write_next:
+                write_cache.extend(to_write_next)
+            else:
+                finished_writers.append(writer)
+
+        for finished in write_cache_finished:
+            write_cache.remove(finished)
+
+        for writer in finished_writers:
             try:
-                res = s.accept()
-                client_sock = res[0]
-                client_stream = client_sock
+                writer.close()
+                all_writers.remove(writer)
+            except ValueError:
+                pass
 
-                print("Request:")
-                req = client_stream.readline()
-                print(req)
-                while True:
-                    h = client_stream.readline()
-                    if h == b"" or h == b"\r\n" or h == None:
-                        break
-                    print(h)
 
-                # Change LED based on request variables
-                request_url = req[4:-11]
-                api = request_url[:5]
-
-                client_stream.write(CONTENT.format(counter, rv, gv, bv))
-
-                client_stream.close()
-                counter += 1
-            except:
-                print("timeout for web... moving on...")
-            print("loop")
-            time.sleep_ms(300)
-    except KeyboardInterrupt:
-        print('Closing')
-    udps.close()
+if __name__ == '__main__':
+    main()
