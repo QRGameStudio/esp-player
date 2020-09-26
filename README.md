@@ -1,19 +1,20 @@
-# Captive Portal Demo
-This is a simple captive portal demo for [MicroPython](http://micropython.org) using NodeMCU/ESP8266.
+# ESP-Player
 
-## Requirements
-Needs RGB LED connected to ports 5, 4, 0 (These are ESP8266 port numbers not the NodeMCU ones)
+A [qrpr](qrpr.eu/) player that can be server localy from your esp32 device running [MicroPython](https://micropython.org/)!
 
-## How to use it 
+## Using
 
-```
-import captive
-captive.start()
-```
+1. install micropython on your esp32 device
+2. run `./flash.sh`, first flash can take several minutes to complete
+3. connect to the `QRGames Player` WiFi
+4.  enter any http:// URL
+5. get redirected to the [http://qrpr.eu](http://qrpr.eu)
+6. profit
 
-## Video demo
+## How it works?
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/gKbe48fQukc" frameborder="0" allowfullscreen></iframe>
+The esp32 acts as a captive portal by rewriting all DNS requests to its own IP address and then serves locally cached copy of the website.
 
-# License
-Consider this software MIT Licensed. Use it at your own risk.
+## Origins
+
+[DNS rewriting mechanism](https://github.com/amora-labs/micropython-captive-portal) was originally made by amora-labs and licensed under MIT.
